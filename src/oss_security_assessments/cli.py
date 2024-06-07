@@ -1,5 +1,7 @@
+import random
 from pathlib import Path
 from time import sleep
+from typing import Iterable, Generator
 
 import yaml
 from dotenv import load_dotenv
@@ -9,6 +11,7 @@ from github.Repository import Repository
 
 from oss_security_assessments.github_selenium import GitHubSelenium
 from oss_security_assessments.onepassword_wrapper import OnePassword
+from .util import fibonacci
 
 
 def load_github_auth_from_github_hub() -> str:
@@ -30,14 +33,16 @@ def load_github() -> Github:
 
 def configure_repository_after_fork(repo: Repository):
     print(f"Configuring {repo.name} ...")
-    repo.edit(
-        has_issues=False,
-        has_projects=False,
-        has_wiki=False
-    )
+    if repo.has_wiki or repo.has_projects or repo.has_issues:
+        repo.edit(
+            has_issues=False,
+            has_projects=False,
+            has_wiki=False
+        )
     workflows = repo.get_workflows()
     for workflow in workflows:
-        if "security" in workflow.name.lower() or "codeql" in workflow.name.lower():
+        lower_name = workflow.name.lower()
+        if "security" in lower_name or "codeql" in lower_name or "semgrep" in lower_name:
             print(f"Keeping {workflow.name} enabled...")
             continue
         if "disabled" in workflow.state:
@@ -56,65 +61,115 @@ def configure_repository_after_fork(repo: Repository):
             print(f"\t{e.data['message'] if 'message' in e.data else e.data}")
 
 
-def fork_repo_to_org(org: Organization, repo: Repository) -> Repository:
+def fork_repo_to_org(org: Organization, repo: Repository) -> (Repository, bool):
     new_repo_name = repo.owner.login + "__" + repo.name
     try:
         existing_repository = org.get_repo(new_repo_name)
         print(f"Using existing fork of {repo.name} to {org.login} with name {new_repo_name} ...")
-        return existing_repository
+        return existing_repository, True
     except UnknownObjectException:
         pass
     print(f"Forking {repo.name} to {org.login} with name {new_repo_name} ...")
     retry_count = 0
     last_exception: GithubException = None
-    while retry_count < 5:
+    while retry_count < 20:
         try:
             return org.create_fork(
                 repo,
                 name=new_repo_name,
                 default_branch_only=True
-            )
+            ), False
         except GithubException as e:
             if e.status != 403:
                 raise e
             print(f"\tFork failed: {e.data['message'] if 'message' in e.data else e.data}")
             retry_count += 1
-            print(f"Retrying in {retry_count} seconds...")
-            sleep(retry_count)
+            sleep_time = fibonacci(retry_count)
+            print(f"Retrying in {sleep_time} seconds...")
+            sleep(sleep_time)
             last_exception = e
     raise last_exception
 
 
-def cli():
-    load_dotenv()
+def fork_and_configure_repositories(
+        gh_selenium: GitHubSelenium,
+        organization: Organization,
+        repositories: Iterable[Repository]
+):
+    process_later: list[Repository] = list()
+    repository: Repository
+    for repository in repositories:
+        if repository.archived:
+            print(f"Skipping {repository.name} because it's archived.")
+            continue
+        if repository.fork:
+            print(f"Skipping {repository.name} because it's a fork.")
+            continue
+
+        new_repository, did_exist = fork_repo_to_org(organization, repository)
+
+        if not did_exist:
+            gh_selenium.enable_github_actions(new_repository)
+
+            configure_repository_after_fork(new_repository)
+        else:
+            process_later.append(new_repository)
+
+    print("🎉 Re-processing repositories that already existed ...")
+
+    for repository in process_later:
+        gh_selenium.enable_github_actions(repository)
+        configure_repository_after_fork(repository)
+
+
+def fork_apache_repositories():
     g = load_github()
     organization = g.get_organization("OSS-Security-Assessments")
     apache = g.get_organization("apache")
 
     one_password = OnePassword()
 
+    repos_to_fork = apache.get_repos(
+        sort="updated",
+        direction="desc",
+    )
+
     with GitHubSelenium() as gh_selenium:
         gh_selenium.login(one_password)
 
-        repos_to_fork = apache.get_repos(
-            sort="updated",
-            direction="desc",
-        )
+        fork_and_configure_repositories(gh_selenium, organization, repos_to_fork)
 
-        repository: Repository
-        for repository in repos_to_fork:
-            if repository.stargazers_count < 100:
-                print(f"Skipping {repository.name} because it has less than 100 stars.")
+
+def lazy_load_wolfi_repositories(github: Github) -> Generator[Repository, None, None]:
+    repos = list()
+    with open("repository_names.txt") as file:
+        for line in file:
+            repository = line.strip()
+            if repository.startswith("jenkinsci"):
+                # My account is banned from forking Jenkins repositories 😭
+                # https://github.com/jenkinsci/continuum-plugin/pull/2#issuecomment-1858768225
                 continue
-            if repository.archived:
-                print(f"Skipping {repository.name} because it's archived.")
-                continue
-            if repository.fork:
-                print(f"Skipping {repository.name} because it's a fork.")
-                continue
+            repos.append(repository)
 
-            new_repository = fork_repo_to_org(organization, repository)
+    random.shuffle(repos)
 
-            gh_selenium.enable_github_actions(new_repository)
+    for repo in repos:
+        yield github.get_repo(repo)
 
-            configure_repository_after_fork(new_repository)
+
+def fork_wolfi_repositories():
+    g = load_github()
+    organization = g.get_organization("Chainguard-Wolfi-Bites-Back")
+    one_password = OnePassword()
+
+    repositories = lazy_load_wolfi_repositories(github=g)
+
+    with GitHubSelenium() as gh_selenium:
+        gh_selenium.login(one_password)
+
+        fork_and_configure_repositories(gh_selenium, organization, repositories)
+
+
+def cli():
+    load_dotenv()
+    fork_wolfi_repositories()

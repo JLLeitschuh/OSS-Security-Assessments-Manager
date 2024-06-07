@@ -46,7 +46,7 @@ class GitHubSelenium:
             repository.get_contents("")
             return True
         except GithubException as e:
-            if "This repository is empty" in e.data["message"]:
+            if "This repository is empty" in e.data["message"] or "Not Found" in e.data["message"]:
                 return False
             else:
                 raise e
