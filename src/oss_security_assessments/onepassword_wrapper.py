@@ -1,4 +1,5 @@
 import subprocess
+from functools import cache
 
 import pyotp
 
@@ -17,14 +18,17 @@ class OnePassword:
             text=True,
         ).strip()
 
+    @cache
     def load_github_username(self) -> str:
         """Load the GitHub username from 1Password."""
         return self._load_secret(get_env_var("ONE_PASSWORD_GITHUB_USERNAME_PATH"))
 
+    @cache
     def load_github_password(self) -> str:
         """Load the GitHub password from 1Password."""
         return self._load_secret(get_env_var("ONE_PASSWORD_GITHUB_PASSWORD_PATH"))
 
+    @cache
     def load_github_oauth_token(self) -> str:
         """Load the GitHub OAuth token from 1Password."""
         return self._load_secret(get_env_var("ONE_PASSWORD_GITHUB_OTP_PATH"))

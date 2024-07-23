@@ -1,3 +1,4 @@
+import argparse
 import random
 from pathlib import Path
 from time import sleep
@@ -82,6 +83,9 @@ def fork_repo_to_org(org: Organization, repo: Repository) -> (Repository, bool):
         except GithubException as e:
             if e.status != 403:
                 raise e
+            if "Resource not accessible by personal access token" in e.data['message']:
+                print(f"\tSkipping {repo.name} because it's not accessible by personal access token.")
+                return None, False
             print(f"\tFork failed: {e.data['message'] if 'message' in e.data else e.data}")
             retry_count += 1
             sleep_time = fibonacci(retry_count)
@@ -107,6 +111,10 @@ def fork_and_configure_repositories(
             continue
 
         new_repository, did_exist = fork_repo_to_org(organization, repository)
+
+        if new_repository is None:
+            print(f"Failed to fork {repository.name} to {organization.login}")
+            continue
 
         if not did_exist:
             gh_selenium.enable_github_actions(new_repository)
@@ -134,20 +142,23 @@ def fork_apache_repositories():
         direction="desc",
     )
 
-    with GitHubSelenium() as gh_selenium:
-        gh_selenium.login(one_password)
+    with GitHubSelenium(one_password) as gh_selenium:
+        gh_selenium.login()
 
         fork_and_configure_repositories(gh_selenium, organization, repos_to_fork)
 
 
-def lazy_load_wolfi_repositories(github: Github) -> Generator[Repository, None, None]:
+def lazy_load_wolfi_repositories(github: Github, repository_file) -> Generator[Repository, None, None]:
     repos = list()
-    with open("repository_names.txt") as file:
+    with repository_file as file:
         for line in file:
             repository = line.strip()
             if repository.startswith("jenkinsci"):
                 # My account is banned from forking Jenkins repositories 😭
                 # https://github.com/jenkinsci/continuum-plugin/pull/2#issuecomment-1858768225
+                continue
+            if not repository.startswith("chainguard"):
+                # I'm already forking Apache repositories
                 continue
             repos.append(repository)
 
@@ -157,19 +168,36 @@ def lazy_load_wolfi_repositories(github: Github) -> Generator[Repository, None, 
         yield github.get_repo(repo)
 
 
-def fork_wolfi_repositories():
+def fork_wolfi_repositories(organization_name: str, repository_file):
     g = load_github()
-    organization = g.get_organization("Chainguard-Wolfi-Bites-Back")
+    organization = g.get_organization(organization_name)
     one_password = OnePassword()
 
-    repositories = lazy_load_wolfi_repositories(github=g)
+    repositories = lazy_load_wolfi_repositories(github=g, repository_file=repository_file)
 
-    with GitHubSelenium() as gh_selenium:
-        gh_selenium.login(one_password)
+    with GitHubSelenium(one_password) as gh_selenium:
+        gh_selenium.login()
 
         fork_and_configure_repositories(gh_selenium, organization, repositories)
 
 
 def cli():
     load_dotenv()
-    fork_wolfi_repositories()
+    # Read in command line arguments
+
+    parser = argparse.ArgumentParser(description="Fork repositories to an organization")
+    parser.add_argument(
+        "--organization",
+        help="The organization to fork repositories to",
+        default="Chainguard-Wolfi-Bites-Back",
+    )
+    parser.add_argument(
+        "repositories",
+        help="The file containing a list of the repositories to fork",
+        type=argparse.FileType('r')
+    )
+    args = parser.parse_args()
+    fork_wolfi_repositories(
+        organization_name=args.organization,
+        repository_file=args.repositories
+    )
