@@ -28,8 +28,9 @@ def load_github_auth_from_github_hub() -> str:
 def load_github() -> Github:
     # using an access token
     auth = Auth.Token(load_github_auth_from_github_hub())
-
-    return Github(auth=auth)
+    gh = Github(auth=auth)
+    print(gh.get_rate_limit())
+    return gh
 
 
 def configure_repository_after_fork(repo: Repository):
@@ -44,12 +45,12 @@ def configure_repository_after_fork(repo: Repository):
     for workflow in workflows:
         lower_name = workflow.name.lower()
         if "security" in lower_name or "codeql" in lower_name or "semgrep" in lower_name:
-            print(f"Keeping {workflow.name} enabled...")
+            print(f"\tKeeping {workflow.name} enabled...")
             continue
         if "disabled" in workflow.state:
-            print(f"Skipping {workflow.name} because it's already disabled.")
+            print(f"\tSkipping {workflow.name} because it's already disabled.")
             continue
-        print(f"Disabling {workflow.name} ...")
+        print(f"\tDisabling {workflow.name} ...")
         # Manually disable the workflow because the API doesn't exist on PyGithub
         try:
             repo._requester.requestJsonAndCheck(
@@ -103,9 +104,9 @@ def fork_and_configure_repositories(
     process_later: list[Repository] = list()
     repository: Repository
     for repository in repositories:
-        if repository.archived:
-            print(f"Skipping {repository.name} because it's archived.")
-            continue
+        # if repository.archived:
+        #     print(f"Skipping {repository.name} because it's archived.")
+        #     continue
         if repository.fork:
             print(f"Skipping {repository.name} because it's a fork.")
             continue
@@ -150,17 +151,21 @@ def fork_apache_repositories():
 
 def lazy_load_wolfi_repositories(github: Github, repository_file) -> Generator[Repository, None, None]:
     repos = list()
-    with repository_file as file:
-        for line in file:
-            repository = line.strip()
-            if repository.startswith("jenkinsci"):
-                # My account is banned from forking Jenkins repositories 😭
-                # https://github.com/jenkinsci/continuum-plugin/pull/2#issuecomment-1858768225
-                continue
-            if not repository.startswith("chainguard"):
-                # I'm already forking Apache repositories
-                continue
-            repos.append(repository)
+    for line in repository_file:
+        repository = line.strip()
+        if repository.startswith("jenkinsci"):
+            # My account is banned from forking Jenkins repositories 😭
+            # https://github.com/jenkinsci/continuum-plugin/pull/2#issuecomment-1858768225
+            continue
+        if repository.startswith("chainguard") or repository.startswith("wolfi"):
+            continue
+        repos.append(repository)
+
+    repository_file.close()
+
+    if not repos:
+        raise ValueError("No repositories to fork found.")
+    print(f"Loaded {len(repos)} repositories to fork...")
 
     random.shuffle(repos)
 
@@ -170,10 +175,11 @@ def lazy_load_wolfi_repositories(github: Github, repository_file) -> Generator[R
 
 def fork_wolfi_repositories(organization_name: str, repository_file):
     g = load_github()
-    organization = g.get_organization(organization_name)
-    one_password = OnePassword()
 
     repositories = lazy_load_wolfi_repositories(github=g, repository_file=repository_file)
+
+    organization = g.get_organization(organization_name)
+    one_password = OnePassword()
 
     with GitHubSelenium(one_password) as gh_selenium:
         gh_selenium.login()
@@ -181,23 +187,64 @@ def fork_wolfi_repositories(organization_name: str, repository_file):
         fork_and_configure_repositories(gh_selenium, organization, repositories)
 
 
+def invoke_sync_upstream(repository: Repository):
+    default_branch = repository.default_branch
+    assert default_branch is not None
+    post_parameters = {"branch": default_branch}
+    repository._requester.requestJsonAndCheck(
+        "POST",
+        f"{repository.url}/merge-upstream",
+        input=post_parameters
+    )
+
+
+def sync_all_repositories(organization_name: str):
+    g = load_github()
+    organization = g.get_organization(organization_name)
+    for repository in organization.get_repos(direction="desc"):
+        print(f"Syncing {repository.name} ...")
+        invoke_sync_upstream(repository)
+        configure_repository_after_fork(repository)
+
+
+def cli_sync_all_repositories(args: argparse.Namespace):
+    sync_all_repositories(organization_name=args.organization)
+
+
+def cli_fork_wolfi_repositories(args: argparse.Namespace):
+    fork_wolfi_repositories(
+        organization_name=args.organization,
+        repository_file=args.repositories
+    )
+
+
 def cli():
     load_dotenv()
     # Read in command line arguments
 
-    parser = argparse.ArgumentParser(description="Fork repositories to an organization")
-    parser.add_argument(
-        "--organization",
-        help="The organization to fork repositories to",
-        default="Chainguard-Wolfi-Bites-Back",
-    )
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="Manage An OSS Organization used for OSS Security Assessments")
+
+    subparser = parser.add_subparsers()
+    fork_parser = subparser.add_parser("fork", help="Fork repositories to an organization")
+    fork_parser.set_defaults(func=cli_fork_wolfi_repositories)
+    sync_parser = subparser.add_parser("sync", help="Sync all repositories in an organization")
+    sync_parser.set_defaults(func=cli_sync_all_repositories)
+
+    def add_default_arguments(sub_parser: argparse.ArgumentParser):
+        sub_parser.add_argument(
+            "--organization",
+            help="The organization to fork repositories to",
+            default="Chainguard-Wolfi-Bites-Back",
+        )
+
+    add_default_arguments(fork_parser)
+    add_default_arguments(sync_parser)
+
+    fork_parser.add_argument(
         "repositories",
         help="The file containing a list of the repositories to fork",
         type=argparse.FileType('r')
     )
     args = parser.parse_args()
-    fork_wolfi_repositories(
-        organization_name=args.organization,
-        repository_file=args.repositories
-    )
+
+    args.func(args)
